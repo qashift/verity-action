@@ -1,12 +1,13 @@
 name: "Verity"
-description: "Run your Playwright suite (Quick check or Full regression), detect flakes, and report to Verity."
+description: "AI-augmented testing: UI/API (Playwright), Mobile (Maestro), Performance (Artillery), Security (ZAP+Semgrep), API contract (Schemathesis). Runs in YOUR CI; reports to Verity."
 author: "QAShift"
 branding:
   icon: "check-circle"
   color: "purple"
 inputs:
+  # ---- core (unchanged) ----
   tier:
-    description: "'fast' (Quick check, diff-aware subset) or 'full' (Full regression, entire suite)."
+    description: "'fast' (Quick check / smoke, diff-aware) or 'full' (Full regression / load)."
     required: false
     default: "fast"
   token:
@@ -20,15 +21,180 @@ inputs:
     description: "Verity API base URL."
     required: false
     default: "https://verity-kappa-ebon.vercel.app"
+  # ---- discipline selection ----
+  engines:
+    description: "Comma-separated engines to run: ui,api,mobile,perf,security,contract. Default 'ui' keeps existing behavior."
+    required: false
+    default: "ui"
+  # ---- mobile (Maestro) ----
+  maestro-flows-dir:
+    description: "Directory of Maestro YAML flows."
+    required: false
+    default: "tests/verity/mobile"
+  maestro-real-device:
+    description: "If 'true', also run flows on real devices via Maestro Cloud (Scale/Enterprise only)."
+    required: false
+    default: "false"
+  maestro-cloud-api-key:
+    description: "Maestro Cloud API key (only used when maestro-real-device is true)."
+    required: false
+    default: ""
+  maestro-app-file:
+    description: "Path to the built app (.apk / .app / .ipa) for Maestro Cloud real-device runs."
+    required: false
+    default: ""
+  # ---- performance (Artillery / Lighthouse) ----
+  perf-config:
+    description: "Path to the AI-generated Artillery config (YAML)."
+    required: false
+    default: "tests/verity/perf/smoke.yml"
+  perf-distributed:
+    description: "If 'true', run Artillery in distributed/serverless mode for higher load than one runner can generate."
+    required: false
+    default: "false"
+  lighthouse-url:
+    description: "If set, run Lighthouse CI against this URL for Core Web Vitals (optional, separate from Artillery)."
+    required: false
+    default: ""
+  # ---- security (ZAP DAST + Semgrep SAST) ----
+  security-target-url:
+    description: "Reachable preview/staging URL for the ZAP DAST scan."
+    required: false
+    default: ""
+  # ---- shared API inputs (reused by contract + perf; NO second upload) ----
+  openapi-spec:
+    description: "Path or URL to the OpenAPI spec (reused for Schemathesis + Artillery)."
+    required: false
+    default: ""
+  api-base-url:
+    description: "Reachable base URL of the API under test (required for Schemathesis to execute)."
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
-    # Self-contained: the runner is vendored in this action (verity.mjs), so it
-    # needs no npm install and no published package — just Node 20+ (default on
-    # ubuntu-latest) and a Playwright install in your workflow.
-    - shell: bash
+    # ============================ UI + API flow (existing, UNCHANGED) ===========
+    # The vendored Playwright runner. Runs whenever 'ui' or 'api' is selected.
+    - name: "Verity — UI/API (Playwright)"
+      if: contains(inputs.engines, 'ui') || contains(inputs.engines, 'api')
+      shell: bash
       env:
         VERITY_INGEST_TOKEN: ${{ inputs.token }}
         VERITY_API_URL: ${{ inputs.api-url }}
         VERITY_PR_NUMBER: ${{ github.event.pull_request.number }}
       run: node "${{ github.action_path }}/verity.mjs" run --tier "${{ inputs.tier }}" --base "${{ inputs.base }}"
+
+    # ============================ MOBILE (Maestro) ==============================
+    # Requires an Android emulator / iOS simulator + Maestro CLI provisioned in
+    # YOUR workflow (see README). Cost is the customer's. Reports via the adapter.
+    - name: "Verity — Mobile (Maestro)"
+      if: contains(inputs.engines, 'mobile')
+      shell: bash
+      env:
+        VERITY_INGEST_TOKEN: ${{ inputs.token }}
+        VERITY_API_URL: ${{ inputs.api-url }}
+        VERITY_PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -e
+        maestro test --format junit --output "$RUNNER_TEMP/maestro-report.xml" "${{ inputs.maestro-flows-dir }}" || true
+        node "${{ github.action_path }}/verity-engines.mjs" mobile --tier "${{ inputs.tier }}" --report "$RUNNER_TEMP/maestro-report.xml"
+
+    # ---- optional real-device add-on via Maestro Cloud (gated by a flag) -------
+    - name: "Verity — Mobile real-device (Maestro Cloud)"
+      if: contains(inputs.engines, 'mobile') && inputs.maestro-real-device == 'true'
+      shell: bash
+      env:
+        MAESTRO_CLOUD_API_KEY: ${{ inputs.maestro-cloud-api-key }}
+        VERITY_INGEST_TOKEN: ${{ inputs.token }}
+        VERITY_API_URL: ${{ inputs.api-url }}
+        VERITY_PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -e
+        maestro cloud --apiKey "$MAESTRO_CLOUD_API_KEY" --format junit --output "$RUNNER_TEMP/maestro-cloud.xml" \
+          "${{ inputs.maestro-app-file }}" "${{ inputs.maestro-flows-dir }}" || true
+        node "${{ github.action_path }}/verity-engines.mjs" mobile --tier "${{ inputs.tier }}" --report "$RUNNER_TEMP/maestro-cloud.xml"
+
+    # ============================ PERFORMANCE (Artillery) =======================
+    # fast = "Perf smoke check" on every PR; full = complete load test.
+    - name: "Verity — Performance (Artillery)"
+      if: contains(inputs.engines, 'perf')
+      shell: bash
+      env:
+        VERITY_INGEST_TOKEN: ${{ inputs.token }}
+        VERITY_API_URL: ${{ inputs.api-url }}
+        VERITY_PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -e
+        ARTILLERY_FLAGS=""
+        if [ "${{ inputs.perf-distributed }}" = "true" ]; then ARTILLERY_FLAGS="--platform aws:fargate"; fi
+        npx --yes artillery@latest run $ARTILLERY_FLAGS --output "$RUNNER_TEMP/perf.json" "${{ inputs.perf-config }}" || true
+        node "${{ github.action_path }}/verity-engines.mjs" perf --tier "${{ inputs.tier }}" --report "$RUNNER_TEMP/perf.json"
+
+    # ---- optional Lighthouse CI (Core Web Vitals) — separate, lightweight ------
+    - name: "Verity — Performance (Lighthouse CWV)"
+      if: contains(inputs.engines, 'perf') && inputs.lighthouse-url != ''
+      shell: bash
+      env:
+        VERITY_INGEST_TOKEN: ${{ inputs.token }}
+        VERITY_API_URL: ${{ inputs.api-url }}
+        VERITY_PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -e
+        npx --yes lighthouse "${{ inputs.lighthouse-url }}" --quiet --chrome-flags="--headless --no-sandbox" \
+          --only-categories=performance --output=json --output-path="$RUNNER_TEMP/lhr.json" || true
+        node "${{ github.action_path }}/verity-engines.mjs" lighthouse --tier "${{ inputs.tier }}" --report "$RUNNER_TEMP/lhr.json"
+
+    # ============================ SECURITY (Docker: Python runtime) =============
+    # SAST — Semgrep CE via the official Docker image (CLI subprocess only; never
+    # linked into our code → clear of LGPL-2.1). Diff on PR, full repo on schedule.
+    - name: "Verity — Security SAST (Semgrep)"
+      if: contains(inputs.engines, 'security')
+      shell: bash
+      env:
+        VERITY_INGEST_TOKEN: ${{ inputs.token }}
+        VERITY_API_URL: ${{ inputs.api-url }}
+        VERITY_PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -e
+        if [ "${{ inputs.tier }}" = "fast" ]; then
+          git diff --name-only "${{ inputs.base }}...HEAD" > "$RUNNER_TEMP/changed.txt" || true
+          TARGETS=$(grep -vE '^$' "$RUNNER_TEMP/changed.txt" | tr '\n' ' ')
+          [ -z "$TARGETS" ] && TARGETS="."
+        else
+          TARGETS="."
+        fi
+        docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src semgrep/semgrep:latest \
+          semgrep scan --config=auto --json --output=/src/semgrep.json $TARGETS || true
+        node "${{ github.action_path }}/verity-engines.mjs" security-sast --tier "${{ inputs.tier }}" --report "$GITHUB_WORKSPACE/semgrep.json"
+
+    # DAST — OWASP ZAP via Docker. Baseline scan on PR, full active scan on merge.
+    - name: "Verity — Security DAST (ZAP)"
+      if: contains(inputs.engines, 'security') && inputs.security-target-url != ''
+      shell: bash
+      env:
+        VERITY_INGEST_TOKEN: ${{ inputs.token }}
+        VERITY_API_URL: ${{ inputs.api-url }}
+        VERITY_PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -e
+        if [ "${{ inputs.tier }}" = "fast" ]; then ZAP_SCRIPT="zap-baseline.py"; else ZAP_SCRIPT="zap-full-scan.py"; fi
+        docker run --rm -v "$GITHUB_WORKSPACE:/zap/wrk:rw" -t ghcr.io/zaproxy/zaproxy:stable \
+          "$ZAP_SCRIPT" -t "${{ inputs.security-target-url }}" -J zap.json || true
+        node "${{ github.action_path }}/verity-engines.mjs" security-dast --tier "${{ inputs.tier }}" --report "$GITHUB_WORKSPACE/zap.json"
+
+    # ============================ API CONTRACT (Docker: Schemathesis) ===========
+    # Property-based contract testing, parallel to the existing Playwright flow
+    # tests. Needs a reachable base URL to execute (internal APIs: customer CI only).
+    - name: "Verity — API contract (Schemathesis)"
+      if: contains(inputs.engines, 'contract') && inputs.openapi-spec != '' && inputs.api-base-url != ''
+      shell: bash
+      env:
+        VERITY_INGEST_TOKEN: ${{ inputs.token }}
+        VERITY_API_URL: ${{ inputs.api-url }}
+        VERITY_PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -e
+        docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src schemathesis/schemathesis:stable \
+          run "${{ inputs.openapi-spec }}" --url "${{ inputs.api-base-url }}" \
+          --report junit --report-junit-path /src/schemathesis.xml || true
+        node "${{ github.action_path }}/verity-engines.mjs" contract --tier "${{ inputs.tier }}" --report "$GITHUB_WORKSPACE/schemathesis.xml"
