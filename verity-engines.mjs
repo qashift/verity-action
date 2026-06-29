@@ -28,11 +28,19 @@ function arg(name, fallback) {
   return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
 const tier = arg("tier", "fast");
-const reportPath = arg("report", "");
+let reportPath = arg("report", "");
 const token = process.env.VERITY_INGEST_TOKEN;
 const apiUrl = (process.env.VERITY_API_URL ?? "https://verity.qashift.com").replace(/\/$/, "");
+// Optional inputs so the runner can RUN the underlying tool itself (so callers
+// never name any tool in their CI config). When --report is given, we skip the
+// run and just adapt that file (back-compat).
+const target = arg("target", process.env.VERITY_TARGET_URL ?? "");
+const spec = arg("spec", process.env.VERITY_OPENAPI_SPEC ?? "");
+const config = arg("config", "");
+const flowsDir = arg("flows-dir", "tests/verity/mobile");
+const base = arg("base", "origin/main");
 
-const VALID = ["mobile", "perf", "lighthouse", "security-dast", "security-sast", "contract"];
+const VALID = ["mobile", "perf", "cwv", "lighthouse", "security-dast", "security-sast", "contract"];
 if (!VALID.includes(engine)) {
   console.error(`✗ Unknown engine '${engine}'. Expected one of: ${VALID.join(", ")}`);
   process.exit(1);
@@ -58,6 +66,63 @@ function readReport() {
     process.exit(1);
   }
   return readFileSync(reportPath, "utf8");
+}
+
+const tmp = process.env.RUNNER_TEMP || process.env.TMPDIR || "/tmp";
+function sh(cmd) {
+  // Tools may exit non-zero when they find issues; we still want their report.
+  try { execSync(cmd, { stdio: "inherit", shell: "/bin/bash" }); } catch { /* keep going */ }
+}
+
+/**
+ * Run the underlying engine to produce a native report, returning its path. This
+ * is what lets a customer's CI config name only Verity — never the tool. Skipped
+ * when --report was passed (already have output).
+ */
+function runEngine() {
+  if (reportPath) return reportPath; // caller supplied a report; just adapt it
+  switch (engine) {
+    case "mobile": {
+      const out = `${tmp}/verity-mobile.xml`;
+      sh(`maestro test --format junit --output "${out}" "${flowsDir}"`);
+      return out;
+    }
+    case "perf": {
+      const out = `${tmp}/verity-perf.json`;
+      const cfg = config || `tests/verity/perf/${tier === "fast" ? "smoke" : "load"}.yml`;
+      sh(`npx --yes artillery@latest run --output "${out}" "${cfg}"`);
+      return out;
+    }
+    case "cwv":
+    case "lighthouse": {
+      const out = `${tmp}/verity-cwv.json`;
+      sh(`npx --yes lighthouse "${target}" --quiet --chrome-flags="--headless --no-sandbox" --only-categories=performance --output=json --output-path="${out}"`);
+      return out;
+    }
+    case "security-sast": {
+      const out = `${tmp}/verity-sast.json`;
+      let targets = ".";
+      if (tier === "fast") {
+        const changed = git(`diff --name-only ${base}...HEAD`).split("\n").filter(Boolean).join(" ");
+        targets = changed || ".";
+      }
+      sh(`docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep:latest semgrep scan --config=auto --json --output=/src/.verity-sast.json ${targets}`);
+      return existsSync(`${process.cwd()}/.verity-sast.json`) ? `${process.cwd()}/.verity-sast.json` : out;
+    }
+    case "security-dast": {
+      const out = `${process.cwd()}/.verity-dast.json`;
+      const script = tier === "fast" ? "zap-baseline.py" : "zap-full-scan.py";
+      sh(`docker run --rm -v "$PWD:/zap/wrk:rw" -t ghcr.io/zaproxy/zaproxy:stable ${script} -t "${target}" -J .verity-dast.json`);
+      return out;
+    }
+    case "contract": {
+      const out = `${process.cwd()}/.verity-contract.xml`;
+      sh(`docker run --rm -v "$PWD:/src" -w /src schemathesis/schemathesis:stable run "${spec}" --url "${target}" --report junit --report-junit-path /src/.verity-contract.xml`);
+      return out;
+    }
+    default:
+      return "";
+  }
 }
 
 /* ----------------- vendored adapters (mirror core) ----------------- */
@@ -191,7 +256,10 @@ function adaptLighthouse(lhr, t) {
 }
 
 /* ----------------------- build + post payload ---------------------- */
-const base = {
+// Run the underlying tool (unless a --report was supplied), then adapt.
+reportPath = runEngine();
+
+const basePayload = {
   tier,
   trigger: tier === "fast" ? "pr" : "merge",
   commit_sha: commitSha,
@@ -205,39 +273,39 @@ let label;
 switch (engine) {
   case "mobile": {
     const results = adaptMaestro(readReport());
-    payload = { ...base, discipline: "mobile", results };
-    label = `Mobile (Maestro) — ${results.length} flow(s)`;
+    payload = { ...basePayload, discipline: "mobile", results };
+    label = `Mobile — ${results.length} flow(s)`;
     break;
   }
   case "contract": {
     const results = adaptSchemathesis(readReport());
-    // API discipline so it groups with flow tests in the dashboard (Flow vs Contract).
-    payload = { ...base, discipline: "api", results };
-    label = `API contract (Schemathesis) — ${results.length} operation(s)`;
+    payload = { ...basePayload, discipline: "api", results };
+    label = `API contract — ${results.length} operation(s)`;
     break;
   }
   case "perf": {
     const perf = adaptArtillery(JSON.parse(readReport()), tier);
-    payload = { ...base, discipline: "performance", results: [], perf };
-    label = `Performance (Artillery) — ${tier === "fast" ? "Perf smoke check" : "Full load test"}`;
+    payload = { ...basePayload, discipline: "performance", results: [], perf };
+    label = `Performance — ${tier === "fast" ? "smoke check" : "full load test"}`;
     break;
   }
+  case "cwv":
   case "lighthouse": {
     const perf = adaptLighthouse(JSON.parse(readReport()), tier);
-    payload = { ...base, discipline: "performance", results: [], perf };
-    label = `Performance (Lighthouse) — Core Web Vitals`;
+    payload = { ...basePayload, discipline: "performance", results: [], perf };
+    label = `Performance — Core Web Vitals`;
     break;
   }
   case "security-dast": {
     const findings = adaptZap(JSON.parse(readReport()));
-    payload = { ...base, discipline: "security", results: [], findings };
-    label = `Security DAST (ZAP) — ${findings.length} finding(s)`;
+    payload = { ...basePayload, discipline: "security", results: [], findings };
+    label = `Security (dynamic) — ${findings.length} finding(s)`;
     break;
   }
   case "security-sast": {
     const findings = adaptSemgrep(JSON.parse(readReport()));
-    payload = { ...base, discipline: "security", results: [], findings };
-    label = `Security SAST (Semgrep) — ${findings.length} finding(s)`;
+    payload = { ...basePayload, discipline: "security", results: [], findings };
+    label = `Security (code) — ${findings.length} finding(s)`;
     break;
   }
 }
